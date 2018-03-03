@@ -179,7 +179,7 @@ func (p *MNSComponent) postMessage(resp ali_mns.MessageReceiveResponse) (err err
 	session.WithPayload(payload)
 	session.WithFromTo(fromUrl, port.GetUrl())
 
-	fbp.SessionWithPort(session, port.GetUrl(), false, port.GetMetadata())
+	fbp.SessionWithPort(session, graph.GetName(), port.GetUrl(), port.GetMetadata())
 
 	err = p.opts.Postman.Post(
 		message.NewUserMessage(session),
