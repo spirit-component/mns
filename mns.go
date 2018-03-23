@@ -1,10 +1,15 @@
 package mns
 
 import (
+	"bytes"
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
 
+	"github.com/go-spirit/spirit/cache"
 	"github.com/go-spirit/spirit/component"
 	"github.com/go-spirit/spirit/doc"
 	"github.com/go-spirit/spirit/mail"
@@ -13,6 +18,7 @@ import (
 	"github.com/go-spirit/spirit/worker/fbp"
 	"github.com/go-spirit/spirit/worker/fbp/protocol"
 	"github.com/gogap/ali_mns"
+	"github.com/pborman/uuid"
 	"github.com/sirupsen/logrus"
 )
 
@@ -33,6 +39,9 @@ type MNSComponent struct {
 	accessKeyId     string
 	accessKeySecret string
 
+	maxSize   int
+	blockSize int
+
 	respChan chan ali_mns.BatchMessageReceiveResponse
 	errChan  chan error
 
@@ -40,6 +49,8 @@ type MNSComponent struct {
 	stopWg *sync.WaitGroup
 
 	alias string
+
+	cache cache.Cache
 }
 
 func init() {
@@ -77,13 +88,29 @@ func (p *MNSComponent) init(opts ...component.Option) (err error) {
 		return
 	}
 
-	akId := p.opts.Config.GetString("access-key-id")
-	akSecret := p.opts.Config.GetString("access-key-secret")
-	endpoint := p.opts.Config.GetString("endpoint")
+	cache, exist := p.opts.Caches.Require("mns")
+	if !exist {
+		err = fmt.Errorf("the cache of `mns` not exist")
+		return
+	}
 
-	p.accessKeyId = akId
-	p.accessKeySecret = akSecret
-	p.endpoint = endpoint
+	if cache.IsLocal() {
+		err = fmt.Errorf("the `mns` driver could not be local")
+		return
+	}
+
+	p.cache = cache
+
+	p.maxSize = int(p.opts.Config.GetInt64("partition.max-size", 1024*30))
+	p.blockSize = int(p.opts.Config.GetInt64("partition.block-size", 1000*1000*512))
+
+	if p.blockSize <= 1000 {
+		p.blockSize = 1000
+	}
+
+	p.accessKeyId = p.opts.Config.GetString("access-key-id")
+	p.accessKeySecret = p.opts.Config.GetString("access-key-secret")
+	p.endpoint = p.opts.Config.GetString("endpoint")
 
 	queuesConf := p.opts.Config.GetConfig("queues")
 
@@ -96,9 +123,9 @@ func (p *MNSComponent) init(opts ...component.Option) (err error) {
 	var mnsQueues []mnsQueue
 
 	for _, name := range qNames {
-		endpoint := queuesConf.GetString("endpoint", endpoint)
-		qAkId := queuesConf.GetString("access-key-id", akId)
-		qAkSecret := queuesConf.GetString("access-key-secret", akSecret)
+		endpoint := queuesConf.GetString("endpoint", p.endpoint)
+		qAkId := queuesConf.GetString("access-key-id", p.accessKeyId)
+		qAkSecret := queuesConf.GetString("access-key-secret", p.accessKeySecret)
 
 		qClient := ali_mns.NewAliMNSClient(endpoint, qAkId, qAkSecret)
 		aliQueue := ali_mns.NewMNSQueue(name, qClient)
@@ -145,6 +172,136 @@ func (p *MNSComponent) Start() error {
 	return nil
 }
 
+type CacheMetadata struct {
+	Md5   string   `json:"md5"`
+	Parts []string `json:"parts"`
+}
+
+func (p *MNSComponent) packPayload(payload *protocol.Payload) (err error) {
+
+	rawBody := payload.Content().GetBody()
+	if len(rawBody) < p.maxSize {
+		return
+	}
+
+	cacheId := uuid.New()
+
+	metadata := &CacheMetadata{
+		Md5: fmt.Sprintf("%0x", md5.Sum(rawBody)),
+	}
+
+	buf := bytes.NewBuffer(rawBody)
+
+	for {
+		next := buf.Next(p.blockSize)
+		if len(next) == 0 {
+			break
+		}
+
+		partId := uuid.New()
+		p.cache.Set("mns.cache:data:"+partId, base64.StdEncoding.EncodeToString(next))
+
+		metadata.Parts = append(metadata.Parts, partId)
+	}
+
+	if payload.Context == nil {
+		payload.Context = make(map[string]string)
+	}
+
+	dataMetadata, err := json.Marshal(metadata)
+	if err != nil {
+		return
+	}
+
+	p.cache.Set("mns.cache:metadata:"+cacheId, string(dataMetadata))
+
+	err = payload.Content().SetBody(dataMetadata)
+
+	if err != nil {
+		return
+	}
+
+	payload.Context["mns.cached"] = cacheId
+
+	logrus.WithField("component", "mns").WithField("cache_id", cacheId).Debugln("cache packed")
+
+	return
+}
+
+func (p *MNSComponent) unpackPayload(payload *protocol.Payload) (err error) {
+	ctx := payload.GetContext()
+
+	if ctx == nil {
+		return
+	}
+
+	cacheId, exist := ctx["mns.cached"]
+
+	if !exist {
+		return
+	}
+
+	cacheV, exist := p.cache.Get("mns.cache:metadata:" + cacheId)
+	if !exist {
+		logrus.Debugf("mns cache time exceed, %s\n", cacheId)
+		return
+	}
+
+	data := cacheV.(string)
+
+	metadata := &CacheMetadata{}
+
+	err = json.Unmarshal([]byte(data), &metadata)
+	if err != nil {
+		err = fmt.Errorf("unmashal mns cache metadata failure, id: %s", cacheId)
+		return
+	}
+
+	unpackedData := bytes.NewBuffer(nil)
+
+	for i := 0; i < len(metadata.Parts); i++ {
+		partDataV, exist := p.cache.Get("mns.cache:data:" + metadata.Parts[i])
+		if !exist {
+			err = fmt.Errorf("get cache metdata part %d failure", i)
+			return
+		}
+
+		partDataBase64, ok := partDataV.(string)
+		if !ok {
+			err = fmt.Errorf("convert part data to base64 string failure")
+			return
+		}
+
+		var partData []byte
+		partData, err = base64.StdEncoding.DecodeString(partDataBase64)
+		if err != nil {
+			return
+		}
+
+		_, err = unpackedData.Write(partData)
+		if err != nil {
+			return
+		}
+	}
+
+	dataMd5 := fmt.Sprintf("%0x", md5.Sum(unpackedData.Bytes()))
+	if dataMd5 != metadata.Md5 {
+		err = fmt.Errorf("unpack data failure, data md5 not match")
+		return
+	}
+
+	delete(ctx, "mns.cached")
+
+	err = payload.Content().SetBody(unpackedData.Bytes())
+	if err != nil {
+		return
+	}
+
+	logrus.WithField("component", "mns").WithField("cache_id", cacheId).Debugln("cache unpacked")
+
+	return
+}
+
 func (p *MNSComponent) postMessage(resp ali_mns.MessageReceiveResponse) (err error) {
 
 	payload := &protocol.Payload{}
@@ -172,6 +329,11 @@ func (p *MNSComponent) postMessage(resp ali_mns.MessageReceiveResponse) (err err
 	prePort, preErr := graph.PrevPort()
 	if preErr == nil {
 		fromUrl = prePort.GetUrl()
+	}
+
+	err = p.unpackPayload(payload)
+	if err != nil {
+		return
 	}
 
 	session := mail.NewSession()
@@ -267,7 +429,7 @@ func (p *MNSComponent) Stop() error {
 // It is a send out func
 func (p *MNSComponent) sendMessage(session mail.Session) (err error) {
 
-	logrus.WithField("component", "MNSComponent").WithField("To", session.To()).Debugln("send message")
+	logrus.WithField("component", "mns").WithField("To", session.To()).Debugln("send message")
 
 	fbp.BreakSession(session)
 
@@ -313,6 +475,11 @@ func (p *MNSComponent) sendMessage(session mail.Session) (err error) {
 	payload, ok := session.Payload().Interface().(*protocol.Payload)
 	if !ok {
 		err = errors.New("could not convert session payload to *protocol.Payload")
+		return
+	}
+
+	err = p.packPayload(payload)
+	if err != nil {
 		return
 	}
 
