@@ -123,16 +123,16 @@ func (p *MNSComponent) init(opts ...component.Option) (err error) {
 	var mnsQueues []mnsQueue
 
 	for _, name := range qNames {
-		name = queuesConf.GetString("queue", name)
+		queueName := queuesConf.GetString(name+".queue", name)
 		endpoint := queuesConf.GetString("endpoint", p.endpoint)
 		qAkId := queuesConf.GetString("access-key-id", p.accessKeyId)
 		qAkSecret := queuesConf.GetString("access-key-secret", p.accessKeySecret)
 
 		qClient := ali_mns.NewAliMNSClient(endpoint, qAkId, qAkSecret)
-		aliQueue := ali_mns.NewMNSQueue(name, qClient)
+		aliQueue := ali_mns.NewMNSQueue(queueName, qClient)
 
 		q := mnsQueue{
-			Name:            name,
+			Name:            queueName,
 			Endpoint:        endpoint,
 			AccessKeyId:     qAkId,
 			AccessKeySecret: qAkSecret,
