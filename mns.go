@@ -51,6 +51,8 @@ type MNSComponent struct {
 	alias string
 
 	cache cache.Cache
+
+	debug bool
 }
 
 func init() {
@@ -87,6 +89,8 @@ func (p *MNSComponent) init(opts ...component.Option) (err error) {
 		err = errors.New("mns component config is nil")
 		return
 	}
+
+	p.debug = p.opts.Config.GetBoolean("debug", false)
 
 	cache, exist := p.opts.Caches.Require("mns")
 	if !exist {
@@ -365,10 +369,19 @@ func (p *MNSComponent) receiveMessage() {
 				}
 
 				for _, m := range resp.Messages {
-					err := p.postMessage(m)
-					if err != nil {
-						logrus.WithField("component", "mns").WithField("alias", p.alias).WithError(err).Errorln("post received mns message failured")
+
+					if p.debug {
+						logrus.WithField("component", "mns").
+							WithField("alias", p.alias).
+							Debugln("mns message received")
 					}
+
+					go func(msg ali_mns.MessageReceiveResponse) {
+						err := p.postMessage(msg)
+						if err != nil {
+							logrus.WithField("component", "mns").WithField("alias", p.alias).WithError(err).Errorln("post received mns message failured")
+						}
+					}(m)
 				}
 			}
 		case err, ok := <-p.errChan:
@@ -500,6 +513,13 @@ func (p *MNSComponent) sendMessage(session mail.Session) (err error) {
 	if err != nil {
 		return
 	}
+
+	logrus.WithField("component", "mns").
+		WithField("to", session.To()).
+		WithField("queue", queueName).
+		WithField("endpoint", endpoint).
+		WithField("access_key_id", akId).
+		Debugln("Message sent")
 
 	return
 }
